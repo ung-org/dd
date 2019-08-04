@@ -24,6 +24,7 @@
 
 #define _XOPEN_SOURCE 700
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <locale.h>
 #include <stdlib.h>
@@ -292,14 +293,17 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	FILE *in = opts[IF].isset ? fopen(opts[IF].value.s, "rb") : stdin;
-	if (in == NULL) {
+	unsigned char ibuf[opts[IBS].value.i];
+	unsigned char obuf[opts[OBS].value.i];
+
+	int in = opts[IF].isset ? open(opts[IF].value.s, O_RDONLY) : STDIN_FILENO;
+	if (in == -1) {
 		fprintf(stderr, "dd: %s: %s\n", opts[IF].value.s, strerror(errno));
 		return 1;
 	}
 
-	FILE *out = opts[OF].isset ? fopen(opts[OF].value.s, "wb") : stdout;
-	if (out == NULL) {
+	int out = opts[OF].isset ? open(opts[OF].value.s, O_WRONLY) : STDIN_FILENO;
+	if (out == -1) {
 		fprintf(stderr, "dd: %s: %s\n", opts[OF].value.s, strerror(errno));
 		return 1;
 	}
@@ -311,6 +315,15 @@ int main(int argc, char *argv[])
 	size_t truncated = 0;
 
 	/* TODO */
+	for (size_t block = 0; opts[COUNT].isset == 0 || block < opts[COUNT].value.i; block++) {
+		ssize_t nread = read(in, ibuf, sizeof(ibuf));
+		if (nread == sizeof(ibuf)) {
+			wholein++;
+		} else {
+			partialin++;
+		}
+
+	}
 
 	fprintf(stderr, "%zu+%zu records in\n", wholein, partialin);
 	fprintf(stderr, "%zu+%zu records out\n", wholeout, partialout);
