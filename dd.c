@@ -1,10 +1,100 @@
-#define _XOPEN_SOURCE 700
+/*
+ * UNG's Not GNU
+ *
+ * Copyright (c) 2011-2019, Jakob Kaivo <jkk@ung.org>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
+#define _XOPEN_SOURCE 700
+#include <errno.h>
 #include <inttypes.h>
+#include <locale.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+enum {
+	IF,
+	OF,
+	IBS,
+	OBS,
+	BS,
+	CBS,
+	SKIP,
+	SEEK,
+	COUNT,
+};
+
+static struct {
+	const char *name;
+	enum { STRING, EXPR, NUMBER } type;
+	int isset;
+	union {
+		char *s;
+		size_t i;
+	} value;
+} opts[] = {
+	[IF] =		{ "if",		STRING, 0, { .s = NULL } },
+	[OF] =		{ "of",		STRING, 0, { .s = NULL } },
+	[IBS] =		{ "ibs",	EXPR,	0, { .i = 512 } },
+	[OBS] =		{ "obs",	EXPR,	0, { .i = 512 } },
+	[BS] =		{ "bs",		EXPR,	0, { .i = 0} },
+	[CBS] =		{ "cbs",	EXPR,	0, { .i = 0} },
+	[SKIP] =	{ "skip",	NUMBER,	0, { .i = 0} },
+	[SEEK] =	{ "seek",	NUMBER,	0, { .i = 0} },
+	[COUNT] =	{ "count",	NUMBER,	0, { .i = 0} },
+};
+static size_t nopts = sizeof(opts) / sizeof(opts[0]);
+
+enum {
+	ASCII	= 1 << 0,
+	EBCDIC	= 1 << 1,
+	IBM	= 1 << 2,
+	BLOCK	= 1 << 3,
+	UNBLOCK = 1 << 4,
+	LCASE	= 1 << 5,
+	UCASE	= 1 << 6,
+	SWAB	= 1 << 7,
+	NOERROR	= 1 << 8,
+	NOTRUNC	= 1 << 9,
+	SYNC	= 1 << 10,
+};
+
+static struct {
+	const char *name;
+	unsigned int flag;
+} convs[] = {
+	{ "ascii",	ASCII },
+	{ "ebcdic",	EBCDIC },
+	{ "ibm",	IBM },
+	{ "block",	BLOCK },
+	{ "unblock",	UNBLOCK },
+	{ "lcase",	LCASE },
+	{ "ucase",	UCASE },
+	{ "swab",	SWAB },
+	{ "noerror",	NOERROR },
+	{ "notrunc",	NOTRUNC },
+	{ "sync",	SYNC },
+};
+static size_t nconvs = sizeof(convs) / sizeof(convs[0]);
 
 static unsigned char ebcdic[] = {
 	0000, 0001, 0002, 0003, 0067, 0055, 0056, 0057,
@@ -43,136 +133,190 @@ static unsigned char ebcdic[] = {
 	0356, 0357, 0372, 0373, 0374, 0375, 0376, 0377,
 };
 
-size_t number(const char *s)
+int setopt(size_t n, char *value)
 {
+	char *end = NULL;
+	intmax_t i = strtoimax(value, &end, 10);
+
+	switch (opts[n].type) {
+	case STRING:
+		opts[n].value.s = value;
+		break;
+
+	case EXPR:
+		/* TODO: handle expr x expr */
+		switch (*end) {
+		case 'k':
+			i *= 1024;
+			break;
+
+		case 'b':
+			i *= 512;
+			break;
+
+		case '\0':
+			break;
+
+		default:
+			fprintf(stderr, "dd: invalid size: %s\n", value);
+			return 1;
+		}
+		opts[n].value.i = i;
+		break;
+
+	case NUMBER:	/* TODO: check for extra stuff */
+		opts[n].value.i = i;
+		if (*end != '\0') {
+			fprintf(stderr, "dd: invalid count: %s\n", value);
+			return 1;
+		}
+		break;
+	}
+
+	opts[n].isset = 1;
+
 	return 0;
 }
 
-size_t blocksize(const char *s)
+unsigned int getconv(const char *v)
 {
-	size_t size = 0;
-	char *end = NULL;
-	while (end == NULL) {
-		uintmax_t n = strtoumax(s, &end, 10);
-		switch (*end) {
-		case 'k':
-			n *= 1024;
-			break;
-		case 'b':
-			n *= 512;
-			break;
-		case '\0':
-			break;
-		default:
-			fprintf(stderr, "Unrecognized character %c\n", *end);
-			return 1;
+	for (size_t i = 0; i < nconvs; i++) {
+		if (!strcmp(v, convs[i].name)) {
+			return convs[i].flag;
 		}
-		size = n;
 	}
-	return size;
+	return 0;
 }
 
-int
-main(int argc, char *argv[])
+unsigned int setconvs(char *values)
 {
-	char *ifname = NULL;
-	char *ofname = NULL;
-	size_t ibs = 512;
-	size_t obs = 512;
-	size_t cbs = 0;
-	size_t skip = 0;
-	size_t seek = 0;
-	size_t count = 0;
-	size_t in_whole = 0, in_part = 0;
-	size_t out_whole = 0, out_part = 0;
-	size_t truncated = 0;
+	unsigned int conversions = 0;
 
-	/* TODO: conv */
-	
+	for (char *v = strtok(values, ","); v != NULL; v = strtok(NULL, ",")) {
+		unsigned int flag = getconv(v);
+		if (flag == 0) {
+			printf("dd: unknown conversion %s\n", v);
+			return 0;
+		}
+		conversions |= flag;
+	}
+
+	return conversions;
+}
+
+int nsetbits(unsigned int i)
+{
+	int n = 0;
+	while (i) {
+		if (i & 1) {
+			n++;
+		}
+		i = i >> 1;
+	}
+	return n;
+}
+
+int mutexconv(unsigned int flags, unsigned int mask)
+{
+	if (nsetbits(flags & mask) <= 1) {
+		return 0;
+	}
+
+	fprintf(stderr, "dd: mutually exclusive conversions:");
+	for (size_t i = 0; i < nconvs; i++) {
+		if (mask & convs[i].flag & flags) {
+			fprintf(stderr, " %s", convs[i].name);
+		}
+	}
+	fprintf(stderr, "\n");
+	return 1;
+}
+
+int main(int argc, char *argv[])
+{
+	setlocale(LC_ALL, "");
+
+	unsigned int conversions = 0;
+
 	int c;
 	while ((c = getopt(argc, argv, "")) != -1) {
-		fprintf(stderr, "dd does not support -o style options\n");
+		fprintf(stderr, "dd: -o style options not supported\n");
 		return 1;
 	}
 
-	for (int i = 1; i < argc; i++) {
+	for (int i = optind; i < argc; i++) {
 		char *operand = argv[i];
 		char *equals = strchr(operand, '=');
 		if (!equals) {
-			fprintf(stderr, "Unrecognized operand %s\n", operand);
+			fprintf(stderr, "dd: unknown operand %s\n", operand);
 			return 1;
 		}
 		
 		*equals = '\0';
-		if (!strcmp(operand, "if")) {
-			ifname = equals + 1;
-		} else if (!strcmp(operand, "of")) {
-			ofname = equals + 1;
-		} else if (!strcmp(operand, "ibs")) {
-			ibs = blocksize(equals + 1);
-		} else if (!strcmp(operand, "obs")) {
-			obs = blocksize(equals + 1);
-		} else if (!strcmp(operand, "bs")) {
-			ibs = blocksize(equals + 1);
-			obs = ibs;
-		} else if (!strcmp(operand, "cbs")) {
-			cbs = number(equals + 1);
-		} else if (!strcmp(operand, "skip")) {
-			skip = number(equals + 1);
-		} else if (!strcmp(operand, "seek")) {
-			seek = number(equals + 1);
-		} else if (!strcmp(operand, "count")) {
-			count = number(equals + 1);
-		} else if (!strcmp(operand, "conv")) {
-		} else {
-			fprintf(stderr, "Unrecognized operand %s\n", operand);
-			return 1;
+		if (!strcmp(operand, "conv")) {
+			conversions = setconvs(equals + 1);
+			if (conversions == 0) {
+				return 1;
+			}
+			continue;
+		}
+
+		for (size_t j = 0; j < nopts; j++) {
+			if (!strcmp(operand, opts[j].name)) {
+				if (setopt(j, equals + 1) != 0) {
+					return 1;
+				}
+				break;
+			}
+			if (j == nopts - 1) {
+				fprintf(stderr, "dd: unknown operand %s\n", operand);
+				return 1;
+			}
 		}
 	}
 
-	unsigned char *buf = malloc(ibs > obs ? ibs : obs);
-	if (buf == NULL) {
-		fprintf(stderr, "Unable to allocate buffer\n");
+	if (opts[BS].isset) {
+		opts[IBS].value.i = opts[BS].value.i;
+		opts[OBS].value.i = opts[BS].value.i;
+	}
+
+	if (mutexconv(conversions, ASCII | EBCDIC | IBM) != 0) {
 		return 1;
 	}
 
-	FILE *iff = ifname ? fopen(ifname, "rb") : stdin;
-	if (!iff) {
-		fprintf(stderr, "Error opening %s\n", ifname);
+	if (mutexconv(conversions, BLOCK | UNBLOCK) != 0) {
 		return 1;
 	}
 
-	FILE *of = ofname ? fopen(ofname, "wb") : stdout;
-	if (!of) {
-		fprintf(stderr, "Error opening %s\n", ofname);
+	if (mutexconv(conversions, LCASE | UCASE) != 0) {
 		return 1;
 	}
-	
-	printf("if=%s\n", ifname);
-	printf("of=%s\n", ofname);
-	printf("ibs=%zd\n", ibs);
-	printf("obs=%zd\n", obs);
-	printf("cbs=%zd\n", cbs);
-	printf("skip=%zd\n", skip);
-	printf("seek=%zd\n", seek);
-	printf("count=%zd\n", count);
-	printf("conv=\n");
 
-	for (size_t blocks = 0; blocks < count; blocks++) {
-		size_t nread = fread(buf, 1, ibs, iff);
-		if (/* sync && */ nread < ibs) {
-			char pad = /* block || unblock ? ' ' : */ '\0';
-			memset(buf + nread, pad, ibs - nread);
-		}
-		/* swab */
-		/* block, unblock, lcase, ucase */
-		fwrite(buf, 1, obs, of);
+	FILE *in = opts[IF].isset ? fopen(opts[IF].value.s, "rb") : stdin;
+	if (in == NULL) {
+		fprintf(stderr, "dd: %s: %s\n", opts[IF].value.s, strerror(errno));
+		return 1;
 	}
 
-	fprintf(stderr, "%zu+%zu records in\n", in_whole, in_part);
-	fprintf(stderr, "%zu+%zu records out\n", out_whole, out_part);
-	if (truncated) {
+	FILE *out = opts[OF].isset ? fopen(opts[OF].value.s, "wb") : stdout;
+	if (out == NULL) {
+		fprintf(stderr, "dd: %s: %s\n", opts[OF].value.s, strerror(errno));
+		return 1;
+	}
+
+	size_t wholein = 0;
+	size_t partialin = 0;
+	size_t wholeout = 0;
+	size_t partialout = 0;
+	size_t truncated = 0;
+
+	/* TODO */
+
+	fprintf(stderr, "%zu+%zu records in\n", wholein, partialin);
+	fprintf(stderr, "%zu+%zu records out\n", wholeout, partialout);
+	if (truncated != 0) {
 		fprintf(stderr, "%zu truncated %s\n", truncated,
 			truncated == 1 ? "record" : "records");
 	}
+	return 0;
 }
